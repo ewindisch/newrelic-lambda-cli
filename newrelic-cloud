@@ -12,7 +12,7 @@ OperationResult = collections.namedtuple(
 _GRAPHQL_API_URL = 'https://api.newrelic.com/graphql'
 _GRAPHQL_EU_API_URL = 'https://api.eu.newrelic.com/graphql'
 
-
+_DEBUG = False
 class NewRelicGraphQLClient:
 
     def __init__(self, nr_account_id, api_key, endpoint):
@@ -61,9 +61,17 @@ class NewRelicGraphQLClient:
 
         req = urllib.request.Request(url=self.url, data=post_data, 
                                      headers=headers, method='POST')
+        if _DEBUG:
+          print(f'Executing GraphQL query: {post_data}', file=open("debug.log", "a"))          
+        
         res = urllib.request.urlopen(req)
         response = res.read()
-        return json.loads(response.decode('utf-8'))
+        json_response = json.loads(response.decode('utf-8'))
+        
+        if _DEBUG:
+          print(f'GraphQL query response: {json_response}', file=open("debug.log", "a"))
+        
+        return json_response
 
     def _get_linked_accounts(self):
         """
@@ -207,8 +215,13 @@ class NewRelicGraphQLClient:
 
 
 def execute_shell_command(command):
+    if _DEBUG:
+      print(f'Executing shell command {command}', file=open("debug.log", "a"))
     response = subprocess.run(command, shell=True, stdout=subprocess.PIPE, 
                               stderr=subprocess.PIPE)
+    if _DEBUG:
+      print(f'Shell command response: {response}', file=open("debug.log", "a"))
+    
     return response
 
 
@@ -307,6 +320,7 @@ def create_function(region, function_name, nr_license_key):
 
 
 def add_function_streaming_filter(region, function_name, function_arn):
+    print('Adding log subscrition filter..')
     cmd = (
         f'aws --region {region} logs put-subscription-filter '
         f'--log-group-name "/aws/lambda/{function_name}" '
@@ -436,7 +450,7 @@ def validate_linked_account(linked_account_name, api_client):
             if user_info['Account'] != account['externalId']:
                 raise Exception(
                   f"The selected linked AWS account [{account['externalId']}] does not match "
-                  f"the AWS account of your default AWS-CLI profile [{user_info['Account']}].")
+                  f"the AWS account of your default AWS-CLI profile [{user_info['Account']}].")    
 
 
 def print_summary(results):
@@ -481,8 +495,12 @@ def setup_log_ingestion(nr_license_key, regions):
 
 def get_endpoint(nr_license_key):
     if nr_license_key.startswith("eu"):
+        if _DEBUG:
+            print('Using GraphQL EU endpoint for GraphQL API')
         return _GRAPHQL_EU_API_URL
     else:
+        if _DEBUG:
+          print('Using GraphQL US endpoint for GraphQL API')
         return _GRAPHQL_API_URL
 
 
@@ -506,20 +524,32 @@ def enable_lambda_monitoring(args):
     api_endpoint = get_endpoint(nr_license_key)
     api_client = NewRelicGraphQLClient(nr_account_id, api_key, api_endpoint)
     try:
-
         validate_linked_account(linked_account_name, api_client)
-
-        role = create_integration_role(role_policy, nr_account_id)
-
-        create_integration_account(
-          nr_account_id, linked_account_name, role, api_client)
-
-        enable_lamba_integration(
-          nr_account_id, linked_account_name, api_client)
-
-        results = setup_log_ingestion(nr_license_key, regions)
     except Exception as e:
-        error_msg = f'Failed to set up lambda integration: {e}'
+        error_msg = f'Failed to validate linked account: {e}'
+        results.append(OperationResult(None, None, True, error_msg))
+        return results
+
+    role = None
+    try:
+      role = create_integration_role(role_policy, nr_account_id)
+    except Exception as e:
+        error_msg = f'Failed to create AWS role: {e}'
+        results.append(OperationResult(None, None, True, error_msg))
+        return results
+    
+    try:
+      create_integration_account(nr_account_id, linked_account_name, role, api_client)
+    except Exception as e:
+        error_msg = f'Failed to create cloud integration account: {e}'
+        results.append(OperationResult(None, None, True, error_msg))
+        return results
+
+    try:
+      enable_lamba_integration(nr_account_id, linked_account_name, api_client)    
+      results = setup_log_ingestion(nr_license_key, regions)
+    except Exception as e:
+        error_msg = f'Failed to enable Lambda integration: {e}'
         results.append(OperationResult(None, None, True, error_msg))
     return results
 
@@ -601,6 +631,11 @@ def main():
         f'(Optional) List of (space-separated) regions where the log '
         f'ingestion function will be installed.'))
 
+    lambda_parser.add_argument(
+      '--debug', required=False, action="store_true",
+      help=(
+        f'(Optional) Print debug information'))
+
     # log ingestion command
     log_ingestion_parser = subparsers.add_parser(
       name='stream-lambda-logs',
@@ -615,9 +650,16 @@ def main():
         f'(Optional) List of (space-separated) regions where the script will '
         f'try to setup the log streaming for the given functions. '
         f'If no value is supplied, it will use all available regions.'))
+    log_ingestion_parser.add_argument(
+      '--debug', required=False, action="store_true",
+      help=(
+        f'(Optional) Print debug information'))
 
     args = main_parser.parse_args()
     results = []
+    if args.debug:
+      global _DEBUG
+      _DEBUG = True
     if args.command == 'set-up-lambda-integration':
         results = enable_lambda_monitoring(vars(args))
     elif args.command == 'stream-lambda-logs':
